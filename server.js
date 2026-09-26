@@ -3,10 +3,26 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  STAGES,
+  TaskError,
+  keyOf,
+  registerRope,
+  recordStage,
+  reviewRope,
+  setCompleted,
+  heldTensioners,
+  applyConfigChange
+} from "./tensionTasks.js";
+import { loadLedger, saveLedger, append, currentHolds } from "./tensionRecords.js";
+import { page } from "./tensionPage.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const dbPath = join(__dirname, "data", "model-rigging-calibration.json");
+const dataDir = process.env.DATA_DIR ? join(process.env.DATA_DIR) : join(__dirname, "data");
+const dbPath = join(dataDir, "model-rigging-calibration.json");
+const ledgerPath = join(dataDir, "tension-ledger.json");
 const port = Number(process.env.PORT || 3038);
+
 const seed = {
   "items": [
     {
@@ -18,28 +34,12 @@ const seed = {
       "owner": "周宁",
       "dueDate": "2026-06-28",
       "status": "校准中",
-      "tasks": [
-        {
-          "id": "T-1",
-          "position": "前桅侧支索",
-          "tension": "偏松",
-          "status": "调整中",
-          "logs": [
-            {
-              "at": "2026-06-12",
-              "note": "已缩短2mm"
-            }
-          ]
-        }
-      ],
+      "tasks": [],
+      "ropes": [],
       "logs": []
     }
   ]
 };
-const fields = [["code","模型编号","text"],["shipType","船型","text"],["scale","比例","text"],["mastCount","桅杆数量","number"],["riggingMaterial","帆索材料","text"],["owner","负责人","text"],["dueDate","交付日期","date"]];
-const stages = ["待检查","校准中","待复核","已交付"];
-const statLabels = ["待检查","校准中","待复核","已交付"];
-const extraFields = [["position","索具位置"],["tension","松紧状态"],["note","调整备注"]];
 
 async function loadDb() {
   if (!existsSync(dbPath)) {
@@ -63,151 +63,189 @@ function html(res, text) {
   res.end(text);
 }
 function newId() { return "MR-" + Date.now(); }
-function computeStats(items) {
-  const stats = Object.fromEntries(statLabels.map(label => [label, 0]));
-  for (const item of items) {
-    if (stats[item.status] !== undefined) stats[item.status] += 1;
-  }
-  return stats;
+function findItem(db, code) {
+  return db.items.find(x => x.id === code || x.code === code);
 }
-function summarize(item) {
-  const logCount = (item.logs || []).length + (item.tasks || []).reduce((n, t) => n + (t.logs || []).length, 0);
-  return { ...item, logCount };
+function summarize(item, holds) {
+  const ropes = item.ropes || [];
+  return {
+    ...item,
+    ropeCount: ropes.length,
+    lockedCount: ropes.filter(r => r.locked).length,
+    doneCount: ropes.filter(r => r.stageIndex === STAGES.length - 1).length,
+    heldTensioners: heldTensioners(item, holds)
+  };
 }
-function page() {
-  return `<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>古船模型帆索校准</title>
-  <style>
-    :root { --bg:#f1f3ef; --panel:#fff; --ink:#20241f; --muted:#687066; --line:#d4ddd0; --accent:#526f43; --warn:#9b4937; }
-    * { box-sizing:border-box; } body { margin:0; background:var(--bg); color:var(--ink); font-family:Arial,"PingFang SC",sans-serif; }
-    header { padding:22px 28px; background:#fff; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; gap:16px; align-items:center; }
-    h1 { margin:0; font-size:26px; } h2 { margin:0 0 12px; font-size:18px; } main { display:grid; grid-template-columns:380px 1fr; gap:22px; padding:22px 28px; }
-    form,.panel,.card,.stat { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; }
-    label { display:block; margin:10px 0 5px; color:var(--muted); font-size:13px; } input,select,textarea { width:100%; border:1px solid var(--line); border-radius:6px; padding:9px; font:inherit; background:#fff; } textarea { min-height:68px; }
-    button { border:0; border-radius:6px; background:var(--accent); color:#fff; padding:10px 13px; font-weight:700; cursor:pointer; } button.secondary { background:#69736a; }
-    .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:10px; margin-bottom:14px; } .stat strong { display:block; font-size:24px; }
-    .toolbar { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:14px; } .toolbar select,.toolbar input { width:auto; min-width:160px; }
-    .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:12px; } .card { display:grid; gap:8px; }
-    .meta { color:var(--muted); font-size:13px; } .pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:3px 8px; font-size:12px; }
-    .logs { border-top:1px solid var(--line); padding-top:8px; max-height:90px; overflow:auto; } .warn { color:var(--warn); font-weight:700; }
-    @media (max-width:900px){ header{display:block;padding:18px 16px;} main{grid-template-columns:1fr;padding:16px;} }
-  </style>
-</head>
-<body>
-  <header><div><h1>古船模型帆索校准</h1><div class="meta">模型、帆索任务和校准记录串联</div></div><button id="reload">刷新</button></header>
-  <main>
-    <section>
-      <form id="createForm"><h2>新增模型</h2><div id="fields"></div><label>初始状态</label><select name="status">${stages.map(s => '<option>'+s+'</option>').join('')}</select><button>保存模型</button></form>
-      <form id="actionForm" style="margin-top:14px"><h2>新增帆索任务</h2><label>选择模型</label><select name="id" id="itemSelect"></select><div id="extraFields"></div><button>提交记录</button></form>
-    </section>
-    <section>
-      <div class="stats" id="stats"></div>
-      <div class="toolbar"><select id="statusFilter"><option value="">全部状态</option>${stages.map(s => '<option>'+s+'</option>').join('')}</select><input id="search" placeholder="搜索编号或关键词"></div>
-      <div class="panel"><h2>创建模型后可拆分帆索任务，逐条记录松紧状态、调整备注和完成时间。</h2><div class="grid" id="cards"></div></div>
-    </section>
-  </main>
-  <script>
-    const fields = [["code","模型编号","text"],["shipType","船型","text"],["scale","比例","text"],["mastCount","桅杆数量","number"],["riggingMaterial","帆索材料","text"],["owner","负责人","text"],["dueDate","交付日期","date"]];
-    const stages = ["待检查","校准中","待复核","已交付"];
-    const extraFields = [["position","索具位置"],["tension","松紧状态"],["note","调整备注"]];
-    const createForm = document.querySelector('#createForm');
-    const actionForm = document.querySelector('#actionForm');
-    const cards = document.querySelector('#cards');
-    const statsEl = document.querySelector('#stats');
-    const itemSelect = document.querySelector('#itemSelect');
-    let items = [];
-    async function api(path, options) {
-      const res = await fetch(path, options && options.body ? { ...options, headers:{ 'Content-Type':'application/json' } } : options);
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || '请求失败');
-      return data;
-    }
-    function renderForms() {
-      document.querySelector('#fields').innerHTML = fields.map(([key,label,type]) => '<label>'+label+'</label><input name="'+key+'" type="'+type+'" '+(key==='code'?'required':'')+'>').join('');
-      document.querySelector('#extraFields').innerHTML = extraFields.map(([key,label]) => '<label>'+label+'</label><input name="'+key+'">').join('');
-    }
-    function render() {
-      itemSelect.innerHTML = items.map(item => '<option value="'+(item.id || item.code)+'">'+(item.code || item.id)+' · '+(item.name || item.shipType || item.source || item.plateSize || '')+'</option>').join('');
-      const stats = Object.fromEntries(stages.map(s => [s, items.filter(i => i.status === s).length]));
-      statsEl.innerHTML = Object.entries(stats).map(([k,v]) => '<div class="stat"><span>'+k+'</span><strong>'+v+'</strong></div>').join('');
-      const status = document.querySelector('#statusFilter').value;
-      const q = document.querySelector('#search').value.trim();
-      const visible = items.filter(item => (!status || item.status === status) && (!q || JSON.stringify(item).includes(q)));
-      cards.innerHTML = visible.map(item => cardHtml(item)).join('');
-      document.querySelectorAll('[data-status]').forEach(sel => sel.onchange = async () => { await api('/api/items/'+sel.dataset.status, { method:'PATCH', body: JSON.stringify({ status: sel.value }) }); await load(); });
-      document.querySelectorAll('[data-note]').forEach(btn => btn.onclick = async () => { const id = btn.dataset.note; const note = prompt('记录备注'); if (note) { await api('/api/items/'+id+'/logs', { method:'POST', body: JSON.stringify({ step:'备注', note }) }); await load(); } });
-    }
-    function cardHtml(item) {
-      const main = fields.slice(0,4).map(([key,label]) => '<div><b>'+label+'</b> '+(item[key] ?? '')+'</div>').join('');
-      const tasks = (item.tasks || []).map(t => '<div class="meta">任务 '+t.position+' · '+t.status+' · '+t.tension+'</div>').join('');
-      const logs = (item.logs || []).slice(-4).map(l => '<div>'+l.step+'：'+l.note+'</div>').join('');
-      return '<article class="card"><h3>'+(item.code || item.id)+'</h3><span class="pill">'+item.status+'</span>'+main+tasks+'<label>状态</label><select data-status="'+(item.id || item.code)+'">'+stages.map(s => '<option '+(s===item.status?'selected':'')+'>'+s+'</option>').join('')+'</select><button class="secondary" data-note="'+(item.id || item.code)+'">追加备注</button><div class="logs meta">'+(logs || '暂无记录')+'</div></article>';
-    }
-    async function load() { items = await api('/api/items'); render(); }
-    createForm.onsubmit = async event => { event.preventDefault(); await api('/api/items', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(createForm).entries())) }); createForm.reset(); await load(); };
-    actionForm.onsubmit = async event => { event.preventDefault(); await api('/api/items/'+itemSelect.value+'/action', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(actionForm).entries())) }); actionForm.reset(); await load(); };
-    document.querySelector('#statusFilter').onchange = render; document.querySelector('#search').oninput = render; document.querySelector('#reload').onclick = load;
-    renderForms(); load();
-  </script>
-</body>
-</html>`;
+
+async function loadState() {
+  const [db, ledger] = await Promise.all([loadDb(), loadLedger(ledgerPath)]);
+  return { db, ledger, holds: currentHolds(ledger) };
 }
 
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
-    const db = await loadDb();
+    const { db, ledger, holds } = await loadState();
+    const persist = async () => { await Promise.all([saveDb(db), saveLedger(ledgerPath, ledger)]); };
+
     if (req.method === "GET" && url.pathname === "/") return html(res, page());
-    if (req.method === "GET" && url.pathname === "/api/items") return send(res, 200, db.items.map(summarize));
+
+    if (req.method === "GET" && url.pathname === "/api/items")
+      return send(res, 200, db.items.map(item => summarize(item, holds)));
+
+    if (req.method === "GET" && url.pathname === "/api/tension-ledger")
+      return send(res, 200, { entries: ledger.entries, tensioners: [...holds.entries()].map(([tensioner, h]) => ({ tensioner, ...h })) });
+
     if (req.method === "POST" && url.pathname === "/api/items") {
       const input = await body(req);
-      const item = { id: newId(), ...input, logs: [{ at: new Date().toISOString(), step: "建档", note: "创建模型" }] };
-      item.tasks = [];
+      if (!input.code) throw new TaskError("code_required", "模型编号必填");
+      if (findItem(db, input.code)) throw new TaskError("code_duplicate", "模型编号已存在", 409);
+      if (input.mastCount !== undefined && !(Number(input.mastCount) > 0))
+        throw new TaskError("mast_required", "桅杆数量必须是正数");
+      const item = {
+        id: newId(),
+        code: input.code,
+        shipType: input.shipType || "",
+        scale: input.scale || "",
+        mastCount: Number(input.mastCount) || null,
+        riggingMaterial: input.riggingMaterial || "",
+        owner: input.owner || "",
+        dueDate: input.dueDate || "",
+        status: input.status || "待检查",
+        tasks: [],
+        ropes: [],
+        logs: [{ at: new Date().toISOString(), step: "建档", note: "创建模型" }]
+      };
       db.items.unshift(item);
-      await saveDb(db);
-      return send(res, 201, item);
+      append(ledger, "model_created", { modelCode: item.code, shipType: item.shipType });
+      await persist();
+      return send(res, 201, summarize(item, holds));
     }
-    const patch = url.pathname.match(/^\/api\/items\/([^/]+)$/);
-    if (patch && req.method === "PATCH") {
-      const item = db.items.find(x => x.id === patch[1] || x.code === patch[1]);
-      if (!item) return send(res, 404, { error: "item_not_found" });
-      Object.assign(item, await body(req));
-      item.logs ||= [];
-      item.logs.push({ at: new Date().toISOString(), step: "状态", note: "更新为" + item.status });
-      await saveDb(db);
-      return send(res, 200, item);
-    }
-    const log = url.pathname.match(/^\/api\/items\/([^/]+)\/logs$/);
-    if (log && req.method === "POST") {
-      const item = db.items.find(x => x.id === log[1] || x.code === log[1]);
-      if (!item) return send(res, 404, { error: "item_not_found" });
+
+    // 登记帆索：目标张力 + 张紧器；新领用写台账，占用到整套完成。
+    const ropePost = url.pathname.match(/^\/api\/items\/([^/]+)\/ropes$/);
+    if (ropePost && req.method === "POST") {
+      const item = findItem(db, ropePost[1]);
+      if (!item) return send(res, 404, { error: "item_not_found", message: "模型不存在" });
       const input = await body(req);
-      item.logs ||= [];
-      item.logs.push({ at: new Date().toISOString(), step: input.step || "记录", note: input.note || "" });
-      await saveDb(db);
-      return send(res, 201, item);
+      const { rope, needIssue } = registerRope(item, input, holds);
+      item.ropes ||= [];
+      item.ropes.push(rope);
+      if (item.status === "待检查") {
+        const from = item.status;
+        item.status = "校准中";
+        append(ledger, "status_changed", { modelCode: keyOf(item), from, to: "校准中" });
+      }
+      append(ledger, "rope_registered", {
+        modelCode: keyOf(item), ropeId: rope.id, position: rope.position,
+        targetTension: rope.targetTension, tensioner: rope.tensioner
+      });
+      if (needIssue) {
+        holds.set(rope.tensioner, { modelCode: keyOf(item), at: new Date().toISOString() });
+        append(ledger, "tensioner_issue", { modelCode: keyOf(item), tensioner: rope.tensioner });
+      }
+      await persist();
+      return send(res, 201, summarize(item, holds));
     }
-    const action = url.pathname.match(/^\/api\/items\/([^/]+)\/action$/);
-    if (action && req.method === "POST") {
-      const item = db.items.find(x => x.id === action[1] || x.code === action[1]);
-      if (!item) return send(res, 404, { error: "item_not_found" });
+
+    // 记一层读数：顺序与分层由任务处把关；偏差超 5% 停机并写台账。
+    const readingPost = url.pathname.match(/^\/api\/items\/([^/]+)\/ropes\/([^/]+)\/readings$/);
+    if (readingPost && req.method === "POST") {
+      const item = findItem(db, readingPost[1]);
+      if (!item) return send(res, 404, { error: "item_not_found", message: "模型不存在" });
+      const rope = (item.ropes || []).find(r => r.id === readingPost[2]);
+      if (!rope) return send(res, 404, { error: "rope_not_found", message: "帆索不存在" });
+
       const input = await body(req);
-      item.logs ||= [];
-      item.tasks ||= [];
-      item.tasks.push({ id: "T-" + Date.now(), position: input.position, tension: input.tension, status: "待检查", logs: [{ at: new Date().toISOString(), note: input.note || "新增帆索任务" }] });
-      item.status = "校准中";
-      item.logs.push({ at: new Date().toISOString(), step: "帆索", note: input.position + " · " + input.tension });
-      await saveDb(db);
-      return send(res, 201, item);
+      const result = recordStage(item, rope, input);
+      if (result.locked) {
+        append(ledger, "reading_deviation", {
+          modelCode: keyOf(item), ropeId: rope.id, position: rope.position, tensioner: rope.tensioner,
+          stage: result.stage.key, expected: result.expected, value: result.value,
+          deviation: result.deviation, master: result.master
+        });
+        await persist();
+        return send(res, 422, { error: "reading_deviation", message: "读数偏离目标超过 5%，已停机；须换另一名师傅复核才能继续", rope });
+      }
+
+      append(ledger, "stage_recorded", {
+        modelCode: keyOf(item), ropeId: rope.id, position: rope.position, tensioner: rope.tensioner,
+        stage: result.stage, expected: result.expected, value: result.value,
+        deviation: result.deviation, master: result.master
+      });
+
+      if (result.completed && setCompleted(item)) {
+        const released = heldTensioners(item, holds);
+        for (const tensioner of released) holds.delete(tensioner);
+        const from = item.status;
+        item.status = "待复核";
+        append(ledger, "status_changed", { modelCode: keyOf(item), from, to: "待复核" });
+        append(ledger, "set_completed", { modelCode: keyOf(item), released });
+      }
+      await persist();
+      return send(res, 201, { rope, completed: result.completed, setCompleted: setCompleted(item) });
     }
-    if (req.method === "GET" && url.pathname === "/api/stats") return send(res, 200, computeStats(db.items));
+
+    // 偏差复核：必须是另一名师傅，放行后可继续本层。
+    const reviewPost = url.pathname.match(/^\/api\/items\/([^/]+)\/ropes\/([^/]+)\/review$/);
+    if (reviewPost && req.method === "POST") {
+      const item = findItem(db, reviewPost[1]);
+      if (!item) return send(res, 404, { error: "item_not_found", message: "模型不存在" });
+      const rope = (item.ropes || []).find(r => r.id === reviewPost[2]);
+      if (!rope) return send(res, 404, { error: "rope_not_found", message: "帆索不存在" });
+      const input = await body(req);
+      const result = reviewRope(rope, input);
+      append(ledger, "review_passed", {
+        modelCode: keyOf(item), ropeId: rope.id, position: rope.position,
+        reviewer: result.reviewer, note: result.note, originalMaster: result.lock.master,
+        stage: result.lock.stage, value: result.lock.value, deviation: result.lock.deviation
+      });
+      await persist();
+      return send(res, 201, { rope });
+    }
+
+    const itemPatch = url.pathname.match(/^\/api\/items\/([^/]+)$/);
+    if (itemPatch && req.method === "PATCH") {
+      const item = findItem(db, itemPatch[1]);
+      if (!item) return send(res, 404, { error: "item_not_found", message: "模型不存在" });
+      const input = await body(req);
+      const allowed = ["shipType", "scale", "owner", "dueDate", "status", "mastCount", "riggingMaterial"];
+      const patch = {};
+      for (const key of allowed) if (input[key] !== undefined && input[key] !== "") patch[key] = input[key];
+
+      // 桅杆数量或帆索材料变更：旧张紧结果立即失效。
+      if (patch.mastCount !== undefined || patch.riggingMaterial !== undefined) {
+        const invalidation = applyConfigChange(item, patch);
+        if (invalidation.changed) {
+          append(ledger, "config_invalidated", {
+            modelCode: keyOf(item),
+            changes: invalidation.changes,
+            voidedCount: invalidation.voided.length,
+            voided: invalidation.voided
+          });
+          if (item.status === "待复核" || item.status === "已交付") {
+            const from = item.status;
+            item.status = "校准中";
+            append(ledger, "status_changed", { modelCode: keyOf(item), from, to: "校准中" });
+          }
+        }
+      }
+      const from = item.status;
+      Object.assign(item, patch);
+      if (patch.status && patch.status !== from) {
+        item.logs ||= [];
+        item.logs.push({ at: new Date().toISOString(), step: "状态", note: from + " → " + item.status });
+        append(ledger, "status_changed", { modelCode: keyOf(item), from, to: item.status });
+      }
+      await persist();
+      return send(res, 200, summarize(item, holds));
+    }
+
     send(res, 404, { error: "not_found" });
   } catch (error) {
+    if (error instanceof TaskError) return send(res, error.status, { error: error.code, message: error.message });
     send(res, 500, { error: error.message });
   }
 });
-server.listen(port, () => console.log("古船模型帆索校准 listening on http://localhost:" + port));
+
+server.listen(port, () => console.log("古船模型帆索分段张紧 listening on http://localhost:" + port));
